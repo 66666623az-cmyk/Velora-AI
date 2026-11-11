@@ -1,0 +1,2476 @@
+import { useEffect, useState, type ChangeEvent, type FormEvent, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+import "./App.css";
+
+type Role = "user" | "assistant";
+type AppMode = "chat" | "tutor";
+type AnswerMode = "fast" | "deep";
+type Theme = "dark" | "light";
+
+type Message = {
+  role: Role;
+  content: string;
+  image?: string;
+};
+
+type Chat = {
+  id: string;
+  title: string;
+  messages: Message[];
+  updatedAt: number;
+  mode: AppMode;
+};
+
+type UserMemory = {
+  id: string;
+  text: string;
+  createdAt: number;
+};
+
+const API_URL =
+  "https://velora-ai-server.velora-ai-mohammad.workers.dev/api/chat";
+
+const STORAGE_KEY = "velora-ai-chats-v1";
+const THEME_KEY = "velora-study-theme-v1";
+const ANSWER_MODE_KEY = "velora-ai-answer-mode-v1";
+const APP_MODE_KEY = "velora-app-mode-v1";
+const USER_NAME_KEY = "velora-user-name-v1";
+const MEMORY_KEY = "velora-study-memories-v1";
+const MAX_MEMORIES = 50;
+
+function createId(): string {
+  return crypto.randomUUID();
+}
+
+function createChat(mode: AppMode): Chat {
+  return {
+    id: createId(),
+    title: "گفت‌وگوی جدید",
+    messages: [],
+    updatedAt: Date.now(),
+    mode,
+  };
+}
+
+function isRole(value: unknown): value is Role {
+  return value === "user" || value === "assistant";
+}
+
+function loadMemories(): UserMemory[] {
+  try {
+    const saved = localStorage.getItem(MEMORY_KEY);
+    if (!saved) return [];
+
+    const parsed: unknown = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed
+      .filter(
+        (item): item is UserMemory =>
+          !!item &&
+          typeof item === "object" &&
+          typeof item.id === "string" &&
+          typeof item.text === "string" &&
+          typeof item.createdAt === "number",
+      )
+      .filter(
+        (item) =>
+          item.text.trim().length > 0 &&
+          item.text.length <= 160,
+      )
+      .slice(0, MAX_MEMORIES);
+  } catch {
+    return [];
+  }
+}
+
+function detectMemory(text: string): string | null {
+  const normalized = text.trim().replace(/\s+/g, " ");
+
+  const patterns = [
+    {
+      regex: /(?:من\s*)?به\s+(.+?)\s+علاقه\s+دارم[.!؟،]?$/u,
+      format: (fact: string) => `علاقه کاربر: ${fact}`,
+    },
+    {
+      regex: /(?:من\s*)?علاقه‌مندم\s+به\s+(.+?)[.!؟،]?$/u,
+      format: (fact: string) => `علاقه کاربر: ${fact}`,
+    },
+    {
+      regex: /(?:یادت باشه|یادت بمونه|به خاطر بسپار)\s*[:،]?\s*(.+)$/u,
+      format: (fact: string) => fact,
+    },
+  ];
+
+  for (const pattern of patterns) {
+    const match = normalized.match(pattern.regex);
+    const fact = match?.[1]?.trim();
+
+    if (fact && fact.length >= 2 && fact.length <= 160) {
+      return pattern.format(fact);
+    }
+  }
+
+  return null;
+}
+
+function loadChats(): Chat[] {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) return [];
+
+    const parsed: unknown = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.flatMap((item: unknown): Chat[] => {
+      if (!item || typeof item !== "object") return [];
+
+      const value = item as Record<string, unknown>;
+
+      if (
+        typeof value.id !== "string" ||
+        typeof value.title !== "string" ||
+        typeof value.updatedAt !== "number" ||
+        !Array.isArray(value.messages)
+      ) {
+        return [];
+      }
+
+      const validMessages = value.messages.every(
+        (message: unknown) => {
+          if (!message || typeof message !== "object") return false;
+
+          const entry = message as Record<string, unknown>;
+
+          return (
+            isRole(entry.role) &&
+            typeof entry.content === "string"
+          );
+        },
+      );
+
+      if (!validMessages) return [];
+
+      return [
+        {
+          id: value.id,
+          title: value.title,
+          updatedAt: value.updatedAt,
+          messages: value.messages as Message[],
+          mode: value.mode === "chat" ? "chat" : "tutor",
+        },
+      ];
+    });
+  } catch {
+    return [];
+  }
+}
+
+function loadTheme(): Theme {
+  try {
+    return localStorage.getItem(THEME_KEY) === "light"
+      ? "light"
+      : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function loadAnswerMode(): AnswerMode {
+  try {
+    return localStorage.getItem(ANSWER_MODE_KEY) === "deep"
+      ? "deep"
+      : "fast";
+  } catch {
+    return "fast";
+  }
+}
+
+function loadAppMode(): AppMode {
+  try {
+    return localStorage.getItem(APP_MODE_KEY) === "chat"
+      ? "chat"
+      : "tutor";
+  } catch {
+    return "tutor";
+  }
+}
+
+function loadUserName(): string {
+  try {
+    return localStorage.getItem(USER_NAME_KEY)?.trim() ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function normalizeMathText(content: string): string {
+  const symbols: Record<string, string> = {
+    "\\leftarrow": "←",
+    "\\rightarrow": "→",
+    "\\Rightarrow": "⇒",
+    "\\Leftarrow": "⇐",
+    "\\times": "×",
+    "\\div": "÷",
+    "\\pm": "±",
+    "\\cdot": "·",
+  };
+
+  return content.replace(
+    /\\\((\\(?:leftarrow|rightarrow|Rightarrow|Leftarrow|times|div|pm|cdot))\\\)/g,
+    (match, command: string) => symbols[command] ?? match,
+  );
+}
+
+function extractText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+
+  if (Array.isArray(node)) {
+    return node.map(extractText).join("");
+  }
+
+  if (node && typeof node === "object" && "props" in node) {
+    return extractText(
+      (node as { props?: { children?: ReactNode } }).props?.children,
+    );
+  }
+
+  return "";
+}
+
+function CopyButton({
+  text,
+  label = "کپی",
+}: {
+  text: string;
+  label?: string;
+}) {
+  const [copied, setCopied] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  async function copyText() {
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopied(true);
+      setFailed(false);
+      window.setTimeout(() => setCopied(false), 1800);
+    } catch {
+      setFailed(true);
+      setCopied(false);
+      window.setTimeout(() => setFailed(false), 1800);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className="velora-copy-button"
+      onClick={() => void copyText()}
+      aria-label={label}
+      title={label}
+    >
+      {copied ? "✓ کپی شد" : failed ? "کپی ناموفق" : `⧉ ${label}`}
+    </button>
+  );
+}
+
+function CopyableCodeBlock({
+  children,
+}: {
+  children: ReactNode;
+}) {
+  const codeText = extractText(children);
+
+  return (
+    <div className="code-block-wrapper" dir="ltr">
+      <div className="code-block-toolbar">
+        <span>Code</span>
+        <CopyButton text={codeText} label="کپی کد" />
+      </div>
+
+      <pre dir="ltr">{children}</pre>
+    </div>
+  );
+}
+
+function AssistantContent({ content }: { content: string }) {
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={{
+        pre: ({ children }) => (
+          <CopyableCodeBlock>{children}</CopyableCodeBlock>
+        ),
+        code: ({ children, className, ...props }) => (
+          <code className={className} {...props}>
+            {children}
+          </code>
+        ),
+        a: ({ children, href, ...props }) => (
+          <a
+            href={href}
+            target="_blank"
+            rel="noreferrer"
+            {...props}
+          >
+            {children}
+          </a>
+        ),
+      }}
+    >
+      {normalizeMathText(content)}
+    </ReactMarkdown>
+  );
+}
+/**
+ * حذف بخش متادیتای فنی از متن قابل نمایش پاسخ.
+ * اگر مدل در پایان پاسخ خط‌هایی مثل model: یا imageModel: تولید کند،
+ * آن خط و همهٔ اطلاعات فنی پس از آن به کاربر نشان داده نمی‌شود.
+ */
+function cleanAssistantText(text: string): string {
+  const metadataPattern = /^\s*(?:model|imageModel|answerMode|searchedWeb|sources)\s*:/im;
+  const match = metadataPattern.exec(text);
+
+  if (!match || match.index === undefined) return text;
+  return text.slice(0, match.index).trimEnd();
+}
+
+async function readAnswerStream(
+  response: Response,
+  onText: (text: string) => void,
+): Promise<string> {
+  if (!response.body) {
+    throw new Error("سرور جریان پاسخ را پشتیبانی نمی‌کند.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+
+  function processLine(line: string) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    const jsonText = trimmed.startsWith("data:")
+      ? trimmed.slice(5).trim()
+      : trimmed;
+
+    if (!jsonText || jsonText === "[DONE]") return;
+
+    let data: {
+      delta?: string;
+      answer?: string;
+      error?: string;
+    };
+
+    try {
+      data = JSON.parse(jsonText) as {
+        delta?: string;
+        answer?: string;
+        error?: string;
+      };
+    } catch {
+      throw new Error("پاسخ ارسالی سرور معتبر نیست.");
+    }
+
+    if (data.error) throw new Error(data.error);
+
+    if (typeof data.delta === "string" && data.delta.length > 0) {
+      fullText += data.delta;
+      onText(cleanAssistantText(fullText));
+    } else if (
+      typeof data.answer === "string" &&
+      !fullText &&
+      data.answer.length > 0
+    ) {
+      fullText = data.answer;
+      onText(cleanAssistantText(fullText));
+    }
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) processLine(line);
+    }
+
+    buffer += decoder.decode();
+    if (buffer.trim()) processLine(buffer);
+  } catch (error) {
+    try {
+      await reader.cancel();
+    } catch {
+      // خطای لغو خواندن نادیده گرفته می‌شود.
+    }
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+
+  const cleanedText = cleanAssistantText(fullText).trim();
+  if (!cleanedText) {
+    throw new Error(
+      "پاسخ قابل‌نمایشی از سرور دریافت نشد. ممکن است فقط اطلاعات فنی ارسال شده باشد.",
+    );
+  }
+
+  return cleanedText;
+}
+
+function App() {
+  const [userName, setUserName] = useState(loadUserName);
+  const [nameInput, setNameInput] = useState("");
+  const [nameError, setNameError] = useState("");
+  const [memories, setMemories] = useState<UserMemory[]>(loadMemories);
+  const [memoryPanelOpen, setMemoryPanelOpen] = useState(false);
+  const [memoryInput, setMemoryInput] = useState("");
+  const [memoryNotice, setMemoryNotice] = useState("");
+  const [chats, setChats] = useState<Chat[]>(() => {
+    const saved = loadChats();
+    return saved.length ? saved : [createChat(loadAppMode())];
+  });
+  const [mode, setMode] = useState<AppMode>(loadAppMode);
+  const [activeChatId, setActiveChatId] = useState(
+    () => loadChats()[0]?.id ?? "",
+  );
+  const [theme, setTheme] = useState<Theme>(loadTheme);
+  const [answerMode, setAnswerMode] =
+    useState<AnswerMode>(loadAnswerMode);
+  const [input, setInput] = useState("");
+  const [selectedImage, setSelectedImage] = useState<{
+    dataUrl: string;
+    name: string;
+  } | null>(null);
+  const [imageError, setImageError] = useState("");
+  const [loadingChatId, setLoadingChatId] = useState<string | null>(
+    null,
+  );
+  const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [streamingMessageKey, setStreamingMessageKey] = useState<
+    string | null
+  >(null);
+
+  const visibleChats = chats
+    .filter((chat) => chat.mode === mode)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+
+  const activeChat =
+    visibleChats.find((chat) => chat.id === activeChatId) ??
+    visibleChats[0];
+
+  useEffect(() => {
+    if (!activeChat || activeChat.id !== activeChatId) {
+      setActiveChatId(activeChat?.id ?? "");
+    }
+  }, [activeChat, activeChatId]);
+
+  useEffect(() => {
+    try {
+      // عکس‌ها فقط در نشست فعلی نمایش داده می‌شوند؛ آن‌ها را در localStorage
+      // ذخیره نمی‌کنیم تا تصاویر حجیم فضای ذخیره‌سازی مرورگر را پر نکنند.
+      const chatsForStorage = chats.map((chat) => ({
+        ...chat,
+        messages: chat.messages.map((message) => ({
+          role: message.role,
+          content: message.content,
+        })),
+      }));
+
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(chatsForStorage));
+    } catch {
+      console.error("ذخیرهٔ گفت‌وگوها ناموفق بود.");
+    }
+  }, [chats]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      console.error("ذخیرهٔ تم ناموفق بود.");
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ANSWER_MODE_KEY, answerMode);
+      localStorage.setItem(APP_MODE_KEY, mode);
+
+      if (userName.trim()) {
+        localStorage.setItem(USER_NAME_KEY, userName.trim());
+      }
+    } catch {
+      console.error("ذخیرهٔ تنظیمات ناموفق بود.");
+    }
+  }, [answerMode, mode, userName]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(MEMORY_KEY, JSON.stringify(memories));
+    } catch {
+      console.error("ذخیرهٔ حافظه‌ها ناموفق بود.");
+    }
+  }, [memories]);
+
+  function addMemory(rawText: string): boolean {
+    const text = rawText.trim().replace(/\s+/g, " ");
+
+    if (!text) {
+      setMemoryNotice("متن حافظه نمی‌تواند خالی باشد.");
+      return false;
+    }
+
+    if (text.length > 160) {
+      setMemoryNotice("هر حافظه حداکثر ۱۶۰ نویسه باشد.");
+      return false;
+    }
+
+    const duplicate = memories.some(
+      (memory) =>
+        memory.text.toLocaleLowerCase() === text.toLocaleLowerCase(),
+    );
+
+    if (duplicate) {
+      setMemoryNotice("این مورد از قبل در حافظه وجود دارد.");
+      return false;
+    }
+
+    if (memories.length >= MAX_MEMORIES) {
+      setMemoryNotice(
+        "ظرفیت حافظه پر شده است؛ ابتدا یک مورد قدیمی را حذف کن.",
+      );
+      return false;
+    }
+
+    const newMemory: UserMemory = {
+      id: createId(),
+      text,
+      createdAt: Date.now(),
+    };
+
+    setMemories((previous) => [newMemory, ...previous]);
+    setMemoryInput("");
+    setMemoryNotice("حافظه با موفقیت ذخیره شد. ✅");
+    return true;
+  }
+
+  function deleteMemory(memoryId: string) {
+    setMemories((previous) =>
+      previous.filter((memory) => memory.id !== memoryId),
+    );
+    setMemoryNotice("حافظه حذف شد.");
+  }
+
+  function saveName(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const cleanName = nameInput.trim();
+
+    if (!cleanName) {
+      setNameError("لطفاً اسمت را وارد کن.");
+      return;
+    }
+
+    if (cleanName.length > 50) {
+      setNameError("اسم باید حداکثر ۵۰ نویسه باشد.");
+      return;
+    }
+
+    setUserName(cleanName);
+    setNameInput("");
+    setNameError("");
+
+    try {
+      localStorage.setItem(USER_NAME_KEY, cleanName);
+    } catch {
+      // برنامه همچنان در همین نشست قابل استفاده است.
+    }
+  }
+
+  function handleImageSelect(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+
+    if (!file) return;
+
+    const allowedTypes = ["image/jpeg", "image/png", "image/webp"];
+
+    if (!allowedTypes.includes(file.type)) {
+      setSelectedImage(null);
+      setImageError("لطفاً یک عکس JPG، PNG یا WebP انتخاب کن.");
+      return;
+    }
+
+    // Worker فعلی دادهٔ تصویر را تا حدود ۷ مگابایت می‌پذیرد؛ ۴ مگابایت
+    // برای فایل اصلی، پس از تبدیل به Base64 نیز حاشیهٔ امن باقی می‌گذارد.
+    if (file.size > 4 * 1024 * 1024) {
+      setSelectedImage(null);
+      setImageError("حجم عکس باید حداکثر ۴ مگابایت باشد.");
+      return;
+    }
+
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      if (typeof reader.result !== "string") {
+        setSelectedImage(null);
+        setImageError("خواندن عکس ناموفق بود؛ دوباره امتحان کن.");
+        return;
+      }
+
+      setSelectedImage({ dataUrl: reader.result, name: file.name });
+      setImageError("");
+    };
+
+    reader.onerror = () => {
+      setSelectedImage(null);
+      setImageError("خواندن عکس ناموفق بود؛ دوباره امتحان کن.");
+    };
+
+    reader.readAsDataURL(file);
+  }
+
+  function updateChat(
+    chatId: string,
+    updater: (chat: Chat) => Chat,
+  ) {
+    setChats((previous) =>
+      previous.map((chat) =>
+        chat.id === chatId ? updater(chat) : chat,
+      ),
+    );
+  }
+
+  function startNewChat(targetMode: AppMode = mode) {
+    const chat = createChat(targetMode);
+
+    setChats((previous) => [chat, ...previous]);
+    setMode(targetMode);
+    setActiveChatId(chat.id);
+    setInput("");
+    setSelectedImage(null);
+    setImageError("");
+    setStreamingMessageKey(null);
+    setSidebarOpen(false);
+  }
+
+  function switchMode(targetMode: AppMode) {
+    if (targetMode === mode) return;
+
+    const existingChat = chats
+      .filter((chat) => chat.mode === targetMode)
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+
+    setMode(targetMode);
+    setInput("");
+    setSelectedImage(null);
+    setImageError("");
+    setStreamingMessageKey(null);
+    setActiveChatId(existingChat?.id ?? "");
+    setSidebarOpen(false);
+
+    if (!existingChat) {
+      startNewChat(targetMode);
+    }
+  }
+
+  async function sendMessage(overrideText?: string) {
+    const text = (overrideText ?? input).trim();
+    const imageToSend = selectedImage;
+
+    if ((!text && !imageToSend) || !activeChat || loadingChatId !== null) {
+      return;
+    }
+
+    const messageText = text || "لطفاً این تصویر را بررسی کن و توضیح بده.";
+    const chatId = activeChat.id;
+    const assistantMessageIndex = activeChat.messages.length + 1;
+
+    // تشخیص علاقه یا اطلاعاتی که کاربر صریحاً خواسته ذخیره شوند.
+    let memoriesForRequest = memories;
+    const detectedMemory = detectMemory(text);
+
+    if (detectedMemory) {
+      const exists = memories.some(
+        (memory) =>
+          memory.text.toLocaleLowerCase() ===
+          detectedMemory.toLocaleLowerCase(),
+      );
+
+      if (!exists && memories.length < MAX_MEMORIES) {
+        const newMemory: UserMemory = {
+          id: createId(),
+          text: detectedMemory,
+          createdAt: Date.now(),
+        };
+
+        memoriesForRequest = [newMemory, ...memories];
+        setMemories(memoriesForRequest);
+      }
+    }
+
+    const updatedMessages: Message[] = [
+      ...activeChat.messages,
+      {
+        role: "user",
+        content: messageText,
+        ...(imageToSend ? { image: imageToSend.dataUrl } : {}),
+      },
+    ];
+
+    setStreamingMessageKey(`${chatId}-${assistantMessageIndex}`);
+
+    updateChat(chatId, (chat) => ({
+      ...chat,
+      title:
+        chat.messages.length === 0
+          ? imageToSend && !text
+            ? "بررسی تصویر"
+            : messageText.slice(0, 35) +
+              (messageText.length > 35 ? "…" : "")
+          : chat.title,
+      messages: [
+        ...chat.messages,
+        {
+          role: "user",
+          content: messageText,
+          ...(imageToSend ? { image: imageToSend.dataUrl } : {}),
+        },
+        { role: "assistant", content: "" },
+      ],
+      updatedAt: Date.now(),
+    }));
+
+    setInput("");
+    setSelectedImage(null);
+    setImageError("");
+    setLoadingChatId(chatId);
+
+    try {
+      const apiMessages: Message[] = updatedMessages
+        .slice(-20)
+        .map((message, index, messages) => {
+          // تصویر در فیلد جداگانهٔ درخواست ارسال می‌شود؛ Base64 را داخل
+          // آرایهٔ پیام‌ها تکرار نمی‌کنیم.
+          const apiMessage: Message = {
+            role: message.role,
+            content: message.content,
+          };
+
+          if (
+            index !== messages.length - 1 ||
+            message.role !== "user"
+          ) {
+            return apiMessage;
+          }
+
+          const personalNote =
+            `\n\nنام کاربر ${userName} است. ` +
+            "در صورت طبیعی بودن، گاهی او را با نامش خطاب کن؛ " +
+            "از تکرار بیش از حد نام خودداری کن. ";
+
+          const modeInstruction =
+            mode === "tutor"
+              ? "مثل یک معلم خصوصی صبور و مهربان آموزش بده. " +
+                "موضوع را ساده و مرحله‌به‌مرحله توضیح بده، " +
+                "مثال بزن و روش حل را نیز آموزش بده."
+              : "مانند یک دستیار هوشمند، دوستانه و دقیق پاسخ بده.";
+
+          const memoryContext =
+            memoriesForRequest.length > 0
+              ? "\n\nاطلاعات ذخیره‌شده از گفته‌های قبلی کاربر:\n" +
+                memoriesForRequest
+                  .map((memory) => `- ${memory.text}`)
+                  .join("\n") +
+                "\nاگر این اطلاعات به سؤال فعلی مرتبط هستند، از آن‌ها برای شخصی‌سازی پاسخ استفاده کن. " +
+                "اگر مرتبط نیستند، بی‌دلیل به آن‌ها اشاره نکن. " +
+                "این موارد را اطلاعات قبلی ذخیره‌شده در نظر بگیر."
+              : "";
+
+          return {
+            ...apiMessage,
+            content:
+              apiMessage.content +
+              personalNote +
+              "\nراهنمای پاسخ‌گویی: " +
+              modeInstruction +
+              memoryContext,
+          };
+        });
+
+      const response = await fetch(API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/x-ndjson",
+        },
+        body: JSON.stringify({
+          messages: apiMessages,
+          answerMode,
+          stream: true,
+          ...(imageToSend ? { image: imageToSend.dataUrl } : {}),
+        }),
+      });
+
+      if (!response.ok) {
+        let errorMessage = "دریافت پاسخ ناموفق بود.";
+
+        try {
+          const errorData = (await response.json()) as {
+            error?: string;
+          };
+
+          if (errorData.error) {
+            errorMessage = errorData.error;
+          }
+        } catch {
+          // بدنهٔ خطا JSON نبود.
+        }
+
+        throw new Error(errorMessage);
+      }
+
+      const answer = await readAnswerStream(
+        response,
+        (partialText) => {
+          updateChat(chatId, (chat) => ({
+            ...chat,
+            messages: chat.messages.map((message, index) =>
+              index === assistantMessageIndex &&
+              message.role === "assistant"
+                ? { ...message, content: partialText }
+                : message,
+            ),
+            updatedAt: Date.now(),
+          }));
+        },
+      );
+
+      updateChat(chatId, (chat) => ({
+        ...chat,
+        messages: chat.messages.map((message, index) =>
+          index === assistantMessageIndex &&
+          message.role === "assistant"
+            ? { ...message, content: answer }
+            : message,
+        ),
+        updatedAt: Date.now(),
+      }));
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error
+          ? error.message
+          : "ارتباط با سرور برقرار نشد.";
+
+      updateChat(chatId, (chat) => ({
+        ...chat,
+        messages: chat.messages.map((message, index) =>
+          index === assistantMessageIndex &&
+          message.role === "assistant"
+            ? {
+                ...message,
+                content:
+                  `**خطا در دریافت پاسخ**\n\n${errorMessage}`,
+              }
+            : message,
+        ),
+        updatedAt: Date.now(),
+      }));
+    } finally {
+      setLoadingChatId((current) =>
+        current === chatId ? null : current,
+      );
+      setStreamingMessageKey(null);
+    }
+  }
+
+  function deleteChat(chatId: string) {
+    const remaining = chats.filter((chat) => chat.id !== chatId);
+
+    if (remaining.length === 0) {
+      const newChat = createChat(mode);
+
+      setChats([newChat]);
+      setActiveChatId(newChat.id);
+      setInput("");
+      setSidebarOpen(false);
+      return;
+    }
+
+    setChats(remaining);
+
+    if (activeChatId === chatId) {
+      const nextChat = remaining
+        .filter((chat) => chat.mode === mode)
+        .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+
+      if (nextChat) {
+        setActiveChatId(nextChat.id);
+      } else {
+        const newChat = createChat(mode);
+        setChats((previous) => [newChat, ...previous]);
+        setActiveChatId(newChat.id);
+      }
+
+      setInput("");
+    }
+  }
+
+  // صفحهٔ شروع: فقط نام کاربر دریافت می‌شود.
+  if (!userName.trim()) {
+    return (
+      <>
+        <style>{`
+          .velora-name-screen {
+            min-height: 100vh;
+            min-height: 100dvh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px;
+            box-sizing: border-box;
+            background:
+              radial-gradient(ellipse at top, #30265f 0%, transparent 55%),
+              #10111b;
+            color: #f7f7ff;
+            font-family: inherit;
+          }
+          .velora-name-card {
+            width: 100%;
+            max-width: 390px;
+            box-sizing: border-box;
+            padding: 30px 24px;
+            border: 1px solid #ffffff20;
+            border-radius: 24px;
+            background: #1b1c2bef;
+            box-shadow: 0 24px 80px #0005;
+            text-align: center;
+          }
+          .velora-name-logo {
+            display: grid;
+            place-items: center;
+            width: 66px;
+            height: 66px;
+            margin: 0 auto 20px;
+            border-radius: 21px;
+            background: linear-gradient(135deg, #8b7bff, #6250d9);
+            color: white;
+            font-size: 32px;
+            font-weight: 800;
+          }
+          .velora-name-card h1 {
+            margin: 0 0 10px;
+            font-size: 25px;
+          }
+          .velora-name-card p {
+            margin: 0 0 24px;
+            color: #b8b8d0;
+            font-size: 14px;
+            line-height: 1.9;
+          }
+          .velora-name-card form {
+            display: grid;
+            gap: 12px;
+          }
+          .velora-name-card input {
+            width: 100%;
+            min-height: 49px;
+            box-sizing: border-box;
+            padding: 12px 14px;
+            border: 1px solid #ffffff25;
+            border-radius: 12px;
+            outline: none;
+            background: #10111b;
+            color: white;
+            font: inherit;
+            font-size: 16px;
+          }
+          .velora-name-card input:focus {
+            border-color: #8b7bff;
+            box-shadow: 0 0 0 3px #8b7bff25;
+          }
+          .velora-name-card form button {
+            min-height: 48px;
+            border: 0;
+            border-radius: 12px;
+            background: #7665f0;
+            color: white;
+            font: inherit;
+            font-weight: 700;
+            cursor: pointer;
+          }
+          .velora-name-card form button:disabled {
+            opacity: .6;
+            cursor: not-allowed;
+          }
+          .velora-name-error {
+            color: #ffaaaa !important;
+            margin: 0 !important;
+            font-size: 12px !important;
+          }
+        `}</style>
+
+        <main className="velora-name-screen" dir="rtl">
+          <section className="velora-name-card">
+            <div className="velora-name-logo">V</div>
+            <h1>سلام! 👋</h1>
+            <p>
+              خوش اومدی به Velora!
+              <br />
+              دوست داری با چه اسمی صدات کنیم؟
+            </p>
+
+            <form onSubmit={saveName}>
+              <input
+                type="text"
+                value={nameInput}
+                onChange={(event) => {
+                  setNameInput(event.target.value);
+                  setNameError("");
+                }}
+                placeholder="اسمت رو بنویس..."
+                aria-label="اسم شما"
+                autoComplete="given-name"
+                autoFocus
+                maxLength={50}
+              />
+
+              {nameError && (
+                <p className="velora-name-error">{nameError}</p>
+              )}
+
+              <button type="submit" disabled={!nameInput.trim()}>
+                شروع کنیم ✨
+              </button>
+            </form>
+          </section>
+        </main>
+      </>
+    );
+  }
+    return (
+    <>
+      <style>{`
+        .theme-light {
+          color-scheme: light;
+          --page-bg: #f7f8fc;
+          --panel-bg: #ffffff;
+          --surface-bg: #f0f2f8;
+          --text-color: #202336;
+          --muted-text: #62677a;
+          --border-color: #dfe3ee;
+          --accent: #6d5ce8;
+        }
+
+        .theme-light,
+        .theme-light * {
+          color-scheme: light;
+        }
+
+        .theme-light .main-panel,
+        .theme-light .chat,
+        .theme-light .messages,
+        .theme-light .welcome,
+        .theme-light .sidebar {
+          color: var(--text-color, #202336);
+        }
+
+        .theme-light .brand p,
+        .theme-light .sidebar-title,
+        .theme-light .sidebar-footer p,
+        .theme-light .status,
+        .theme-light .composer-note,
+        .theme-light .message-label,
+        .theme-light .answer-mode-description {
+          color: var(--muted-text, #62677a) !important;
+        }
+
+        .theme-light .assistant-answer,
+        .theme-light .assistant-answer p,
+        .theme-light .assistant-answer li,
+        .theme-light .assistant-answer blockquote,
+        .theme-light .assistant-answer h1,
+        .theme-light .assistant-answer h2,
+        .theme-light .assistant-answer h3,
+        .theme-light .assistant-answer h4,
+        .theme-light .assistant-answer strong,
+        .theme-light .assistant-answer em,
+        .theme-light .assistant-answer td,
+        .theme-light .assistant-answer th {
+          color: #202336;
+        }
+
+        .theme-light .assistant-answer a {
+          color: #5141c8;
+        }
+
+        .theme-light .assistant-answer pre {
+          background: #eef0f6;
+          color: #202336;
+          border: 1px solid #dfe3ee;
+          overflow-x: auto;
+        }
+
+        .theme-light .assistant-answer code {
+          color: #8a285d;
+          background: #f0edf7;
+        }
+
+        .theme-light .assistant-answer pre code {
+          color: inherit;
+          background: transparent;
+        }
+
+        .theme-light .assistant-answer table,
+        .theme-light .assistant-answer th,
+        .theme-light .assistant-answer td {
+          border-color: #dfe3ee;
+        }
+
+        .theme-light .user-message-content {
+          color: #202336;
+        }
+
+        .theme-light .composer textarea {
+          color: #202336;
+          background: #ffffff;
+          caret-color: #5141c8;
+        }
+
+        .theme-light .composer textarea::placeholder {
+          color: #777d90;
+          opacity: 1;
+        }
+
+        .theme-light .sidebar button,
+        .theme-light .sidebar button span,
+        .theme-light .sidebar button svg,
+        .theme-light .sidebar a,
+        .theme-light .sidebar [role="button"],
+        .theme-light .chat-list-item,
+        .theme-light .chat-list-item span,
+        .theme-light .chat-list-item svg,
+        .theme-light .chat-select,
+        .theme-light .sidebar-footer,
+        .theme-light .sidebar-footer span {
+          color: #202336;
+        }
+
+        .theme-light .sidebar .new-chat-button {
+          background: #6d5ce8 !important;
+          color: #ffffff !important;
+          border: 1px solid #6d5ce8 !important;
+        }
+
+        .theme-light .sidebar .new-chat-button span {
+          color: #ffffff !important;
+        }
+
+        .theme-light .message.user .user-message-content {
+          color: #202336 !important;
+          background: #e9e7ff !important;
+          border-color: #d5d0ff !important;
+        }
+
+        .theme-light .message.user .user-message-content * {
+          color: #202336 !important;
+        }
+
+        .code-block-wrapper {
+          margin: 1rem 0;
+          overflow: hidden;
+          border: 1px solid var(--border-color, #dfe3ee);
+          border-radius: 12px;
+          background: var(--surface-bg, #171923);
+          max-width: 100%;
+        }
+
+        .code-block-toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 7px 10px;
+          border-bottom: 1px solid var(--border-color, #dfe3ee);
+          color: var(--muted-text, #777d90);
+          font-size: 12px;
+        }
+
+        .velora-copy-button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 5px;
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 8px;
+          padding: 6px 9px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-size: 12px;
+          line-height: 1.5;
+          cursor: pointer;
+          transition: background 150ms ease, border-color 150ms ease;
+        }
+
+        .velora-copy-button:hover {
+          background: #8882;
+        }
+
+        .message-copy-row {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-top: 8px;
+        }
+
+        .message-copy-row .velora-copy-button {
+          opacity: .85;
+        }
+
+        .code-block-wrapper pre {
+          margin: 0;
+          border: 0;
+          border-radius: 0;
+          overflow-x: auto;
+          padding: 14px;
+          max-width: 100%;
+        }
+
+        .theme-light .code-block-wrapper {
+          background: #eef0f6;
+          border-color: #dfe3ee;
+        }
+
+        .theme-light .code-block-toolbar {
+          color: #62677a;
+          border-color: #dfe3ee;
+        }
+
+        .theme-light .velora-copy-button,
+        .theme-light .katex,
+        .theme-light .katex * {
+          color: #202336;
+        }
+
+        .answer-mode-picker {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 8px;
+          padding: 0 2px 8px;
+        }
+
+        .answer-mode-button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 7px;
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 12px;
+          padding: 8px 12px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-size: 13px;
+          cursor: pointer;
+          transition: background 150ms ease, border-color 150ms ease;
+        }
+
+        .answer-mode-button[aria-pressed="true"] {
+          background: var(--accent, #7867f5);
+          border-color: var(--accent, #7867f5);
+          color: white;
+          font-weight: 700;
+        }
+
+        .answer-mode-button:disabled {
+          opacity: .6;
+          cursor: not-allowed;
+        }
+
+        .answer-mode-description {
+          flex-basis: 100%;
+          margin: 0;
+          font-size: 12px;
+          line-height: 1.7;
+          color: var(--muted-text, #777d90);
+        }
+
+        .streaming-cursor {
+          display: inline-block;
+          margin-inline-start: 3px;
+          animation: velora-cursor-blink 1s steps(2, start) infinite;
+        }
+
+          to { visibility: hidden; }
+        }
+
+        .app.chat-layout {
+          min-height: 100dvh;
+          min-height: 100vh;
+        }
+
+        .app.chat-layout .sidebar {
+          display: flex !important;
+        }
+
+        .app.chat-layout .sidebar.sidebar-closed {
+          display: none !important;
+        }
+
+        .app.chat-layout .sidebar.sidebar-open {
+          display: flex !important;
+        }
+
+        .app.chat-layout .topbar nav {
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          gap: 8px;
+          flex-wrap: nowrap;
+          min-width: 0;
+        }
+
+        .app.chat-layout .topbar nav button {
+          width: auto;
+          min-width: max-content;
+          flex: 0 0 auto;
+          white-space: nowrap;
+        }
+
+        .app.chat-layout .main-panel {
+          min-width: 0;
+          min-height: 100dvh;
+        }
+
+        .app.chat-layout .chat,
+        .app.chat-layout .messages,
+        .app.chat-layout .assistant-answer {
+          min-width: 0;
+          overflow-wrap: anywhere;
+        }
+
+        .app.chat-layout .composer textarea {
+          box-sizing: border-box;
+          max-width: 100%;
+          resize: vertical;
+        }
+
+        .app.chat-layout .assistant-answer img {
+          max-width: 100%;
+          height: auto;
+        }
+
+        /* پیوست و نمایش عکس */
+        .velora-image-controls {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 8px;
+          width: 100%;
+          flex-basis: 100%;
+          min-width: 0;
+        }
+
+        .velora-image-input {
+          display: none;
+        }
+
+        .velora-image-button {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 6px;
+          min-height: 38px;
+          padding: 8px 12px;
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 10px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-size: 12px;
+          cursor: pointer;
+        }
+
+        .velora-image-button:hover:not(:disabled) {
+          background: #8882;
+        }
+
+        .velora-image-button:disabled {
+          opacity: .55;
+          cursor: not-allowed;
+        }
+
+        .velora-image-preview {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          width: 100%;
+          min-width: 0;
+          box-sizing: border-box;
+          padding: 8px;
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 12px;
+        }
+
+        .velora-image-preview img {
+          width: 54px;
+          height: 54px;
+          flex-shrink: 0;
+          object-fit: cover;
+          border-radius: 8px;
+        }
+
+        .velora-image-preview-name {
+          flex: 1;
+          min-width: 0;
+          overflow-wrap: anywhere;
+          font-size: 12px;
+        }
+
+        .velora-image-preview button {
+          width: 32px;
+          height: 32px;
+          flex-shrink: 0;
+          border: 1px solid #e46d7b66;
+          border-radius: 8px;
+          background: transparent;
+          color: #e46d7b;
+          font: inherit;
+          font-size: 20px;
+          cursor: pointer;
+        }
+
+        .velora-image-error {
+          flex-basis: 100%;
+          margin: 0;
+          color: #e46d7b;
+          font-size: 12px;
+          line-height: 1.7;
+        }
+
+        .velora-image-storage-note {
+          flex-basis: 100%;
+          margin: 0;
+          color: var(--muted-text, #777d90);
+          font-size: 11px;
+          line-height: 1.7;
+        }
+
+        .user-attached-image {
+          display: block;
+          width: auto;
+          max-width: min(320px, 100%);
+          max-height: 320px;
+          margin: 0 0 10px;
+          object-fit: contain;
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 12px;
+        }
+
+        .theme-light .velora-image-preview {
+          border-color: #dfe3ee;
+        }
+
+        /* حافظهٔ شخصی Velora */
+        .velora-memory-button {
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 10px;
+          padding: 8px 10px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-size: 12px;
+          cursor: pointer;
+          white-space: nowrap;
+        }
+
+        .velora-memory-button:hover {
+          background: #8882;
+        }
+
+        .velora-memory-overlay {
+          position: fixed;
+          inset: 0;
+          z-index: 2000;
+          display: grid;
+          place-items: center;
+          padding: 16px;
+          box-sizing: border-box;
+          background: #0009;
+          backdrop-filter: blur(5px);
+        }
+
+        .velora-memory-panel {
+          width: 100%;
+          max-width: 520px;
+          max-height: 85dvh;
+          overflow-y: auto;
+          box-sizing: border-box;
+          padding: 20px;
+          border: 1px solid #ffffff20;
+          border-radius: 20px;
+          background: #1b1c2b;
+          color: #f7f7ff;
+          box-shadow: 0 24px 80px #0006;
+        }
+
+        .velora-memory-panel.memory-light {
+          background: #fff;
+          color: #202336;
+          border-color: #dfe3ee;
+        }
+
+        .velora-memory-header {
+          display: flex;
+          align-items: flex-start;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 18px;
+        }
+
+        .velora-memory-header h2 {
+          margin: 0 0 6px;
+          font-size: 20px;
+        }
+
+        .velora-memory-header p {
+          margin: 0;
+          opacity: .75;
+          font-size: 12px;
+          line-height: 1.8;
+        }
+
+        .velora-memory-header > button {
+          width: 36px;
+          height: 36px;
+          flex-shrink: 0;
+          border: 1px solid #8885;
+          border-radius: 10px;
+          background: transparent;
+          color: inherit;
+          font-size: 24px;
+          cursor: pointer;
+        }
+
+        .velora-memory-form {
+          display: flex;
+          gap: 8px;
+          margin-bottom: 12px;
+        }
+
+        .velora-memory-form input {
+          flex: 1;
+          min-width: 0;
+          box-sizing: border-box;
+          padding: 11px;
+          border: 1px solid #8885;
+          border-radius: 10px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-size: 13px;
+        }
+
+        .velora-memory-form input::placeholder {
+          color: #999;
+        }
+
+        .velora-memory-form button {
+          border: 0;
+          border-radius: 10px;
+          padding: 0 15px;
+          background: #7665f0;
+          color: white;
+          font: inherit;
+          cursor: pointer;
+        }
+
+        .velora-memory-notice {
+          font-size: 12px;
+          line-height: 1.8;
+          color: #a99dff;
+        }
+
+        .memory-light .velora-memory-notice {
+          color: #5141c8;
+        }
+
+        .velora-memory-list {
+          display: grid;
+          gap: 9px;
+          margin-top: 12px;
+        }
+
+        .velora-memory-item {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 11px;
+          border: 1px solid #8884;
+          border-radius: 12px;
+          font-size: 13px;
+          line-height: 1.8;
+          overflow-wrap: anywhere;
+        }
+
+        .velora-memory-item span {
+          flex: 1;
+        }
+
+        .velora-memory-item button {
+          flex-shrink: 0;
+          border: 1px solid #e46d7b66;
+          border-radius: 8px;
+          padding: 6px 9px;
+          background: transparent;
+          color: #ff8c9a;
+          font: inherit;
+          font-size: 11px;
+          cursor: pointer;
+        }
+
+        .memory-light .velora-memory-item button {
+          color: #b42336;
+        }
+
+        .velora-memory-empty,
+        .velora-memory-footer {
+          font-size: 12px;
+          line-height: 2;
+          opacity: .8;
+        }
+
+        .velora-memory-footer {
+          margin-top: 18px;
+        }
+
+        @media (max-width: 760px) {
+          .app.chat-layout {
+            width: 100%;
+            max-width: 100%;
+            overflow-x: clip;
+          }
+
+          .app.chat-layout .sidebar.sidebar-open {
+            position: fixed;
+            z-index: 1000;
+            inset-block: 0;
+            inset-inline-start: 0;
+            width: min(86vw, 320px);
+            max-width: 320px;
+            height: 100dvh;
+            overflow-y: auto;
+            box-shadow: 0 0 0 100vmax #0008;
+          }
+
+          .app.chat-layout .main-panel {
+            width: 100%;
+            max-width: 100%;
+          }
+
+          .app.chat-layout .topbar {
+            box-sizing: border-box;
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 10px;
+            height: auto;
+            min-height: 64px;
+            padding: 10px 12px;
+          }
+
+          .app.chat-layout .brand {
+            flex: 1 1 130px;
+            min-width: 0;
+          }
+
+          .app.chat-layout .brand h1 {
+            font-size: 17px;
+          }
+
+          .app.chat-layout .brand p {
+            font-size: 11px;
+          }
+
+          .app.chat-layout .topbar nav {
+            order: 3;
+            flex: 1 1 100%;
+            width: 100%;
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 7px;
+          }
+
+          .app.chat-layout .topbar nav button {
+            box-sizing: border-box;
+            width: 100%;
+            min-width: 0;
+            padding: 10px 6px !important;
+            font-size: 12px !important;
+          }
+
+          .app.chat-layout .chat-header-actions {
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            gap: 8px;
+            margin-inline-start: auto;
+          }
+
+          .app.chat-layout .status {
+            font-size: 11px;
+            white-space: nowrap;
+          }
+
+          .app.chat-layout .chat {
+            box-sizing: border-box;
+            width: 100%;
+            padding-inline: 12px;
+          }
+
+          .app.chat-layout .messages {
+            width: 100%;
+            gap: 18px;
+          }
+
+          .app.chat-layout .message {
+            max-width: 100%;
+          }
+
+          .app.chat-layout .assistant-answer {
+            font-size: 14px;
+            line-height: 1.9;
+          }
+
+          .app.chat-layout .welcome {
+            padding: 28px 8px;
+          }
+
+          .app.chat-layout .welcome h2 {
+            font-size: 21px;
+            line-height: 1.6;
+          }
+
+          .app.chat-layout .welcome p {
+            font-size: 13px;
+            line-height: 1.9;
+          }
+
+          .app.chat-layout .suggestions {
+            width: 100%;
+            grid-template-columns: 1fr;
+          }
+
+          .app.chat-layout .suggestions button {
+            width: 100%;
+            min-height: 44px;
+          }
+
+          .app.chat-layout .composer {
+            box-sizing: border-box;
+            width: 100%;
+            padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+          }
+
+          .app.chat-layout .answer-mode-picker {
+            gap: 6px;
+          }
+
+          .app.chat-layout .answer-mode-button {
+            flex: 1 1 calc(50% - 6px);
+            padding: 9px 6px;
+            font-size: 12px;
+          }
+
+          .app.chat-layout .answer-mode-description {
+            font-size: 11px;
+          }
+
+          .app.chat-layout .composer textarea {
+            min-height: 44px;
+            font-size: 16px;
+          }
+
+          .app.chat-layout .composer-note {
+            font-size: 10px;
+          }
+
+          .app.chat-layout .code-block-wrapper pre {
+            font-size: 12px;
+            padding: 10px;
+          }
+
+          .app.chat-layout .assistant-answer table {
+            display: block;
+            max-width: 100%;
+            overflow-x: auto;
+          }
+
+          .app.chat-layout .assistant-answer .katex-display {
+            max-width: 100%;
+            overflow-x: auto;
+            overflow-y: hidden;
+          }
+
+          .app.chat-layout .message-copy-row .velora-copy-button {
+            min-height: 34px;
+            padding: 6px 10px;
+          }
+        }
+
+        @media (max-width: 480px) {
+          .velora-memory-panel {
+            padding: 15px;
+          }
+
+          .velora-memory-form {
+            flex-direction: column;
+          }
+
+          .velora-memory-form button {
+            min-height: 42px;
+          }
+
+          .velora-memory-button {
+            padding: 7px;
+            font-size: 11px;
+          }
+        }
+
+        @media (max-width: 380px) {
+          .app.chat-layout .brand h1 {
+            font-size: 15px;
+          }
+
+          .app.chat-layout .status {
+            font-size: 10px;
+          }
+
+          .app.chat-layout .topbar {
+            padding-inline: 8px;
+          }
+
+          .app.chat-layout .composer {
+            padding-inline: 8px;
+          }
+        }
+      `}</style>
+
+      <main className={`app study-app chat-layout theme-${theme}`}>
+        <aside
+          className={`sidebar ${
+            sidebarOpen ? "sidebar-open" : "sidebar-closed"
+          }`}
+          aria-label="فهرست گفت‌وگوها"
+        >
+          <div className="sidebar-header">
+            <button
+              className="new-chat-button"
+              onClick={() => startNewChat()}
+              type="button"
+            >
+              <span>＋</span> گفت‌وگوی جدید
+            </button>
+
+            <button
+              className="icon-button sidebar-toggle"
+              onClick={() => setSidebarOpen(false)}
+              type="button"
+              aria-label="بستن فهرست چت‌ها"
+            >
+              ×
+            </button>
+          </div>
+
+          <h3 className="sidebar-title">گفت‌وگوهای قبلی</h3>
+
+          <div className="chat-list">
+            {visibleChats.map((chat) => (
+              <div
+                className={`chat-list-item ${
+                  chat.id === activeChat?.id ? "active" : ""
+                }`}
+                key={chat.id}
+              >
+                <button
+                  className="chat-select"
+                  type="button"
+                  onClick={() => {
+                    setActiveChatId(chat.id);
+                    setInput("");
+                    setSelectedImage(null);
+                    setImageError("");
+                    setSidebarOpen(false);
+                  }}
+                  title={chat.title}
+                >
+                  <span className="chat-icon">◷</span>
+                  <span className="chat-title">{chat.title}</span>
+                </button>
+
+                <button
+                  className="delete-chat-button"
+                  type="button"
+                  onClick={() => deleteChat(chat.id)}
+                  aria-label={`حذف ${chat.title}`}
+                  title="حذف گفت‌وگو"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+
+            {visibleChats.length === 0 && (
+              <p className="sidebar-title">
+                هنوز گفت‌وگویی در این بخش نداری.
+              </p>
+            )}
+          </div>
+
+          <div className="sidebar-footer">
+            <span className="logo small-logo">V</span>
+
+            <div>
+              <strong>
+                {mode === "tutor" ? "Velora Study" : "Velora AI"}
+              </strong>
+
+              <p>
+                {mode === "tutor"
+                  ? `معلم هوشمند ${userName}`
+                  : `دستیار هوشمند ${userName}`}
+              </p>
+            </div>
+          </div>
+        </aside>
+
+        <section className="main-panel">
+          <header className="topbar">
+            <button
+              className="icon-button mobile-sidebar-button"
+              onClick={() => setSidebarOpen((open) => !open)}
+              type="button"
+              aria-label="نمایش فهرست چت‌ها"
+            >
+              ☰
+            </button>
+
+            <div className="brand">
+              <div className="logo">V</div>
+
+              <div>
+                <h1>
+                  {mode === "tutor" ? "Velora Study" : "Velora AI"}
+                </h1>
+
+                <p>
+                  {mode === "tutor"
+                    ? `معلم هوشمند ${userName}`
+                    : `دستیار هوشمند ${userName}`}
+                </p>
+              </div>
+            </div>
+
+            <nav aria-label="انتخاب حالت">
+              <button
+                type="button"
+                onClick={() => switchMode("chat")}
+                aria-pressed={mode === "chat"}
+                style={{
+                  padding: "9px 16px",
+                  borderRadius: 12,
+                  border: "1px solid var(--border-color, #8885)",
+                  cursor: "pointer",
+                  font: "inherit",
+                  background:
+                    mode === "chat"
+                      ? "var(--accent, #7867f5)"
+                      : "transparent",
+                  color: mode === "chat" ? "white" : "inherit",
+                  fontWeight: mode === "chat" ? 700 : 500,
+                }}
+              >
+                💬 چت
+              </button>
+
+              <button
+                type="button"
+                onClick={() => switchMode("tutor")}
+                                aria-pressed={mode === "tutor"}
+                style={{
+                  padding: "9px 16px",
+                  borderRadius: 12,
+                  border: "1px solid var(--border-color, #8885)",
+                  cursor: "pointer",
+                  font: "inherit",
+                  background:
+                    mode === "tutor"
+                      ? "var(--accent, #7867f5)"
+                      : "transparent",
+                  color: mode === "tutor" ? "white" : "inherit",
+                  fontWeight: mode === "tutor" ? 700 : 500,
+                }}
+              >
+                🎓 معلم هوشمند
+              </button>
+            </nav>
+
+            <div className="chat-header-actions">
+              <button
+                type="button"
+                className="velora-memory-button"
+                onClick={() => {
+                  setMemoryNotice("");
+                  setMemoryPanelOpen(true);
+                }}
+                aria-label="مدیریت حافظه"
+                title="مشاهده و مدیریت حافظه"
+              >
+                🧠 حافظه ({memories.length})
+              </button>
+
+              <button
+                className="study-theme-button"
+                type="button"
+                onClick={() =>
+                  setTheme((current) =>
+                    current === "dark" ? "light" : "dark",
+                  )
+                }
+                aria-label="تغییر تم"
+              >
+                {theme === "dark" ? "☀️" : "🌙"}
+              </button>
+
+              <span className="status">
+                <span className="status-dot" />
+                {loadingChatId === activeChat?.id
+                  ? "در حال پاسخ‌گویی"
+                  : "آماده"}
+              </span>
+            </div>
+          </header>
+
+          <section className="chat">
+            {!activeChat || activeChat.messages.length === 0 ? (
+              <div className="welcome">
+                <div className="welcome-icon">✦</div>
+
+                <h2>
+                  {mode === "tutor"
+                    ? `سلام ${userName}! آماده‌ای یاد بگیری؟ 🎓`
+                    : `سلام ${userName}! 👋`}
+                </h2>
+
+                <p>
+                  {mode === "tutor"
+                    ? "موضوع یا سؤالت را بگو تا با هم قدم‌به‌قدم یاد بگیریم."
+                    : "هر چیزی دوست داری بپرس یا درباره‌اش گپ بزن."}
+                </p>
+
+                <div className="suggestions">
+                  {mode === "tutor" ? (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInput(
+                            "کسرها را با مثال ساده و مرحله‌به‌مرحله به من یاد بده.",
+                          )
+                        }
+                      >
+                        ➗ آموزش یک موضوع
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInput(
+                            "یک آزمون کوتاه از من بگیر و بعد جواب‌هایم را بررسی کن.",
+                          )
+                        }
+                      >
+                        📝 آزمون تمرینی
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInput(
+                            "این موضوع را ساده توضیح بده و در پایان یک سؤال برای تمرین از من بپرس.",
+                          )
+                        }
+                      >
+                        💡 تمرین و یادگیری
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInput("سلام! خودت را معرفی کن.")
+                        }
+                      >
+                        👋 شروع گفت‌وگو
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInput("چند ایدهٔ خلاقانه و جالب پیشنهاد بده.")
+                        }
+                      >
+                        ✨ ایده‌پردازی
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() =>
+                          setInput("این متن را خلاصه و ساده کن: ")
+                        }
+                      >
+                        📝 کمک با متن
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="messages">
+                {activeChat.messages.map((message, index) => {
+                  const messageKey = `${activeChat.id}-${index}`;
+
+                  const isStreaming =
+                    streamingMessageKey === messageKey &&
+                    loadingChatId === activeChat.id;
+
+                  return (
+                    <div
+                      className={`message ${message.role}`}
+                      key={messageKey}
+                    >
+                      <span className="message-label">
+                        {message.role === "user"
+                          ? userName
+                          : mode === "tutor"
+                            ? "معلم هوشمند"
+                            : "Velora AI"}
+                      </span>
+
+                      <div
+                        className={
+                          message.role === "assistant"
+                            ? "assistant-answer"
+                            : "user-message-content"
+                        }
+                        dir="auto"
+                      >
+                        {message.role === "user" && message.image && (
+                          <img
+                            className="user-attached-image"
+                            src={message.image}
+                            alt="تصویر ارسال‌شده"
+                            loading="lazy"
+                          />
+                        )}
+
+                        {message.role === "assistant" ? (
+                          <>
+                            {message.content ? (
+                              <AssistantContent
+                                content={message.content}
+                              />
+                            ) : isStreaming ? (
+                              <span>در حال نوشتن پاسخ…</span>
+                            ) : null}
+
+                            {isStreaming && (
+                              <span
+                                className="streaming-cursor"
+                                aria-hidden="true"
+                              >
+                                ▍
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          message.content
+                        )}
+                      </div>
+
+                      {message.content.trim() !== "" && (
+                        <div className="message-copy-row">
+                          <CopyButton
+                            text={message.content}
+                            label={
+                              message.role === "user"
+                                ? "کپی سؤال"
+                                : "کپی پاسخ"
+                            }
+                          />
+                        </div>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </section>
+
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void sendMessage();
+            }}
+          >
+            <div
+              className="answer-mode-picker"
+              aria-label="حالت پاسخ‌گویی"
+            >
+              <button
+                className="answer-mode-button"
+                type="button"
+                aria-pressed={answerMode === "fast"}
+                onClick={() => setAnswerMode("fast")}
+                disabled={loadingChatId !== null}
+                title="پاسخ سریع برای سؤال‌های معمولی"
+              >
+                ⚡ پاسخ سریع
+              </button>
+
+              <button
+                className="answer-mode-button"
+                type="button"
+                aria-pressed={answerMode === "deep"}
+                onClick={() => setAnswerMode("deep")}
+                disabled={loadingChatId !== null}
+                title="برای مسائل پیچیده و چندمرحله‌ای"
+              >
+                🧠 تفکر عمیق
+              </button>
+
+              <p className="answer-mode-description">
+                {answerMode === "deep"
+                  ? "تفکر عمیق فعال است؛ ممکن است پاسخ دیرتر آماده شود."
+                  : "پاسخ سریع فعال است؛ مناسب سؤال‌های روزمره."}
+              </p>
+            </div>
+
+            <div className="velora-image-controls">
+              <input
+                id="velora-image-input"
+                className="velora-image-input"
+                type="file"
+                accept="image/jpeg,image/png,image/webp"
+                disabled={loadingChatId !== null}
+                onChange={handleImageSelect}
+                aria-label="انتخاب عکس"
+              />
+
+              <button
+                className="velora-image-button"
+                type="button"
+                disabled={loadingChatId !== null}
+                onClick={() =>
+                  document.getElementById("velora-image-input")?.click()
+                }
+                aria-label="پیوست عکس"
+                title="پیوست عکس"
+              >
+                📎 افزودن عکس
+              </button>
+
+              {selectedImage && (
+                <div className="velora-image-preview" dir="rtl">
+                  <img
+                    src={selectedImage.dataUrl}
+                    alt="پیش‌نمایش عکس"
+                  />
+
+                  <span className="velora-image-preview-name">
+                    {selectedImage.name}
+                  </span>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedImage(null);
+                      setImageError("");
+                    }}
+                    aria-label="حذف عکس انتخاب‌شده"
+                    title="حذف عکس"
+                  >
+                    ×
+                  </button>
+                </div>
+              )}
+
+              {imageError && (
+                <p className="velora-image-error" role="alert">
+                  {imageError}
+                </p>
+              )}
+
+              {selectedImage && (
+                <p className="velora-image-storage-note">
+                  عکس پس از بارگذاری مجدد صفحه در تاریخچه باقی نمی‌ماند.
+                </p>
+              )}
+            </div>
+
+            <textarea
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (
+                  event.key === "Enter" &&
+                  !event.shiftKey &&
+                  !event.nativeEvent.isComposing
+                ) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }}
+              placeholder={
+                mode === "tutor"
+                  ? `${userName}، سؤالت رو بپرس تا با هم یاد بگیریم...`
+                  : `${userName}، پیامت رو بنویس...`
+              }
+              rows={1}
+              aria-label="پیام شما"
+            />
+
+            <button
+              className="send-button"
+              type="submit"
+              disabled={
+                (!input.trim() && !selectedImage) ||
+                loadingChatId !== null
+              }
+              aria-label="ارسال پیام"
+            >
+              ↑
+            </button>
+
+            <p className="composer-note">
+              گفت‌وگوها، اسمت و حافظه‌ها در همین مرورگر ذخیره می‌شوند.
+            </p>
+          </form>
+        </section>
+
+        {memoryPanelOpen && (
+          <div className="velora-memory-overlay">
+            <section
+              className={`velora-memory-panel ${
+                theme === "light" ? "memory-light" : ""
+              }`}
+              dir="rtl"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="velora-memory-title"
+            >
+              <header className="velora-memory-header">
+                <div>
+                  <h2 id="velora-memory-title">🧠 حافظهٔ Velora</h2>
+
+                  <p>
+                    علایق و اطلاعاتی که برای گفت‌وگوهای بعدی ذخیره شده‌اند
+                  </p>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => setMemoryPanelOpen(false)}
+                  aria-label="بستن پنل حافظه"
+                >
+                  ×
+                </button>
+              </header>
+
+              <form
+                className="velora-memory-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  addMemory(memoryInput);
+                }}
+              >
+                <input
+                  value={memoryInput}
+                  onChange={(event) => {
+                    setMemoryInput(event.target.value);
+                    setMemoryNotice("");
+                  }}
+                  placeholder="مثلاً به یادگیری پایتون علاقه دارم"
+                  maxLength={160}
+                  aria-label="حافظهٔ جدید"
+                />
+
+                <button type="submit">ذخیره</button>
+              </form>
+
+              {memoryNotice && (
+                <p className="velora-memory-notice" role="status">
+                  {memoryNotice}
+                </p>
+              )}
+
+              <div className="velora-memory-list">
+                {memories.length === 0 ? (
+                  <p className="velora-memory-empty">
+                    هنوز حافظه‌ای ذخیره نشده است.
+                    <br />
+                    می‌توانی موردی را بالا اضافه کنی یا در چت بنویسی:
+                    <br />
+                    «من به برنامه‌نویسی علاقه دارم».
+                  </p>
+                ) : (
+                  memories.map((memory) => (
+                    <div
+                      className="velora-memory-item"
+                      key={memory.id}
+                    >
+                      <span>{memory.text}</span>
+
+                      <button
+                        type="button"
+                        onClick={() => deleteMemory(memory.id)}
+                        aria-label={`حذف حافظه ${memory.text}`}
+                      >
+                        حذف
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
+              <p className="velora-memory-footer">
+                حافظه‌ها در همین مرورگر ذخیره می‌شوند و همراه پیام‌های جدید
+                برای هوش مصنوعی ارسال می‌شوند. حداکثر ظرفیت: {MAX_MEMORIES} مورد.
+              </p>
+            </section>
+          </div>
+        )}
+      </main>
+    </>
+  );
+}
+
+export default App;

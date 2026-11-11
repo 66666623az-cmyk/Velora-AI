@@ -1,0 +1,982 @@
+
+import { useEffect, useState, type ReactNode } from "react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
+import "katex/dist/katex.min.css";
+import "./App.css";
+
+type Message = {
+  role: "user" | "assistant";
+  content: string;
+};
+
+type Chat = {
+  id: string;
+  title: string;
+  messages: Message[];
+  updatedAt: number;
+};
+
+type AnswerMode = "fast" | "deep";
+
+const API_URL =
+  "https://velora-ai-server.velora-ai-mohammad.workers.dev/api/chat";
+const STORAGE_KEY = "velora-ai-chats-v1";
+const THEME_KEY = "velora-study-theme-v1";
+const ANSWER_MODE_KEY = "velora-ai-answer-mode-v1";
+
+function createChat(): Chat {
+  return {
+    id: crypto.randomUUID(),
+    title: "گفت‌وگوی جدید",
+    messages: [],
+    updatedAt: Date.now(),
+  };
+}
+
+function loadChats(): Chat[] {
+  try {
+    const saved = localStorage.getItem(STORAGE_KEY);
+    if (!saved) return [];
+
+    const parsed: unknown = JSON.parse(saved);
+    if (!Array.isArray(parsed)) return [];
+
+    return parsed.filter(
+      (item): item is Chat =>
+        typeof item === "object" &&
+        item !== null &&
+        "id" in item &&
+        typeof item.id === "string" &&
+        "title" in item &&
+        typeof item.title === "string" &&
+        "messages" in item &&
+        Array.isArray(item.messages) &&
+        "updatedAt" in item &&
+        typeof item.updatedAt === "number" &&
+        item.messages.every(
+          (message: unknown) =>
+            typeof message === "object" &&
+            message !== null &&
+            "role" in message &&
+            "content" in message &&
+            (message.role === "user" || message.role === "assistant") &&
+            typeof message.content === "string",
+        ),
+    );
+  } catch {
+    return [];
+  }
+}
+
+function loadTheme(): "dark" | "light" {
+  try {
+    return localStorage.getItem(THEME_KEY) === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function loadAnswerMode(): AnswerMode {
+  try {
+    return localStorage.getItem(ANSWER_MODE_KEY) === "deep"
+      ? "deep"
+      : "fast";
+  } catch {
+    return "fast";
+  }
+}
+
+function normalizeMathText(content: string): string {
+  const symbols: Record<string, string> = {
+    "\\leftarrow": "←",
+    "\\rightarrow": "→",
+    "\\Rightarrow": "⇒",
+    "\\Leftarrow": "⇐",
+    "\\times": "×",
+    "\\div": "÷",
+    "\\pm": "±",
+    "\\cdot": "·",
+  };
+
+  return content.replace(
+    /\$(\\(?:leftarrow|rightarrow|Rightarrow|Leftarrow|times|div|pm|cdot))\$/g,
+    (match, command: string) => symbols[command] ?? match,
+  );
+}
+
+function extractText(node: ReactNode): string {
+  if (typeof node === "string" || typeof node === "number") {
+    return String(node);
+  }
+
+  if (Array.isArray(node)) {
+    return node.map(extractText).join("");
+  }
+
+  if (node && typeof node === "object" && "props" in node) {
+    return extractText(
+      (node as { props?: { children?: ReactNode } }).props?.children,
+    );
+  }
+
+  return "";
+}
+
+function CopyableCodeBlock({ children }: { children: ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const codeText = extractText(children);
+
+  async function copyCode() {
+    try {
+      await navigator.clipboard.writeText(codeText);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1600);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return (
+    <div className="code-block-wrapper" dir="ltr">
+      <div className="code-block-toolbar">
+        <span>Code</span>
+        <button
+          type="button"
+          className="copy-code-button"
+          onClick={() => void copyCode()}
+          aria-label="کپی کد"
+        >
+          {copied ? "✓ کپی شد" : "⧉ کپی کد"}
+        </button>
+      </div>
+      <pre dir="ltr">{children}</pre>
+    </div>
+  );
+}
+
+function AssistantContent({ content }: { content: string }) {
+  const normalizedContent = normalizeMathText(content);
+
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
+      components={{
+        pre: ({ children }) => (
+          <CopyableCodeBlock>{children}</CopyableCodeBlock>
+        ),
+        code: ({ children, className, ...props }) => (
+          <code className={className} {...props}>
+            {children}
+          </code>
+        ),
+        a: ({ children, href, ...props }) => (
+          <a href={href} target="_blank" rel="noreferrer" {...props}>
+            {children}
+          </a>
+        ),
+      }}
+    >
+      {normalizedContent}
+    </ReactMarkdown>
+  );
+}
+
+/**
+ * پاسخ جریانی سرور را می‌خواند.
+ * این تابع برای پروتکل NDJSON نوشته شده است:
+ * هر خط باید یک JSON مستقل مثل {"delta":"سلام"} باشد.
+ * سرور باید دقیقاً همین پروتکل را ارسال کند.
+ */
+async function readAnswerStream(
+  response: Response,
+  onText: (text: string) => void,
+): Promise<string> {
+  if (!response.body) {
+    throw new Error("سرور جریان پاسخ را پشتیبانی نمی‌کند.");
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullText = "";
+
+  function processLine(line: string) {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    const data = JSON.parse(trimmed) as {
+      delta?: string;
+      answer?: string;
+      error?: string;
+      done?: boolean;
+    };
+
+    if (data.error) {
+      throw new Error(data.error);
+    }
+
+    // قرارداد اصلی جریان: هر پیام شامل delta است.
+    if (typeof data.delta === "string" && data.delta.length > 0) {
+      fullText += data.delta;
+      onText(fullText);
+    }
+
+    // پشتیبانی اختیاری از پاسخ نهایی کامل.
+    if (
+      typeof data.answer === "string" &&
+      !fullText &&
+      data.answer.length > 0
+    ) {
+      fullText = data.answer;
+      onText(fullText);
+    }
+  }
+
+  try {
+    while (true) {
+      const { value, done } = await reader.read();
+
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() ?? "";
+
+      for (const line of lines) {
+        processLine(line);
+      }
+    }
+
+    buffer += decoder.decode();
+
+    if (buffer.trim()) {
+      processLine(buffer);
+    }
+  } catch (error) {
+    try {
+      await reader.cancel();
+    } catch {
+      // نادیده‌گرفتن خطای لغو خواندن
+    }
+
+    throw error;
+  } finally {
+    reader.releaseLock();
+  }
+
+  if (!fullText.trim()) {
+    throw new Error("سرور پاسخ معتبری برنگرداند.");
+  }
+
+  return fullText;
+}
+
+function App() {
+  const [chats, setChats] = useState<Chat[]>(() => {
+    const saved = loadChats();
+    return saved.length > 0 ? saved : [createChat()];
+  });
+
+  const [activeChatId, setActiveChatId] = useState(
+    () => loadChats()[0]?.id ?? "",
+  );
+  const [theme, setTheme] = useState<"dark" | "light">(loadTheme);
+  const [mode, setMode] = useState<"chat" | "tutor">("tutor");
+  const [answerMode, setAnswerMode] = useState<AnswerMode>(loadAnswerMode);
+  const [input, setInput] = useState("");
+  const [loadingChatId, setLoadingChatId] = useState<string | null>(null);
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [streamingMessageKey, setStreamingMessageKey] = useState<string | null>(
+    null,
+  );
+
+  const activeChat = chats.find((chat) => chat.id === activeChatId) ?? chats[0];
+
+  useEffect(() => {
+    if (!activeChatId && chats[0]) {
+      setActiveChatId(chats[0].id);
+    }
+  }, [activeChatId, chats]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(chats));
+    } catch {
+      console.error("ذخیرهٔ گفت‌وگوها ناموفق بود.");
+    }
+  }, [chats]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(THEME_KEY, theme);
+    } catch {
+      console.error("ذخیرهٔ تم ناموفق بود.");
+    }
+  }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(ANSWER_MODE_KEY, answerMode);
+    } catch {
+      console.error("ذخیرهٔ حالت پاسخ ناموفق بود.");
+    }
+  }, [answerMode]);
+
+  function updateChat(chatId: string, updater: (chat: Chat) => Chat) {
+    setChats((previous) =>
+      previous.map((chat) => (chat.id === chatId ? updater(chat) : chat)),
+    );
+  }
+
+  function startNewChat() {
+    const chat = createChat();
+
+    setChats((previous) => [chat, ...previous]);
+    setActiveChatId(chat.id);
+    setInput("");
+    setStreamingMessageKey(null);
+  }
+
+  async function sendMessage(overrideText?: string) {
+    const text = (overrideText ?? input).trim();
+
+    if (!text || !activeChat || loadingChatId) return;
+
+    const chatId = activeChat.id;
+    const updatedMessages: Message[] = [
+      ...activeChat.messages,
+      { role: "user", content: text },
+    ];
+
+    setStreamingMessageKey(null);
+
+    updateChat(chatId, (chat) => ({
+      ...chat,
+      title:
+        chat.messages.length === 0
+          ? text.slice(0, 35) + (text.length > 35 ? "…" : "")
+          : chat.title,
+      messages: updatedMessages,
+      updatedAt: Date.now(),
+    }));
+
+    setInput("");
+    setLoadingChatId(chatId);
+
+    const assistantMessageIndex = updatedMessages.length;
+
+    // پیام خالی دستیار را از ابتدا ایجاد می‌کنیم تا متن جریانی
+    // هم‌زمان با رسیدن از سرور نمایش داده شود.
+    updateChat(chatId, (chat) => ({
+      ...chat,
+      messages: [
+        ...chat.messages,
+        { role: "assistant", content: "" },
+      ],
+      updatedAt: Date.now(),
+    }));
+
+    setStreamingMessageKey(`${chatId}-${assistantMessageIndex}`);
+
+    try {
+      const apiMessages = updatedMessages.slice(-20).map((message, index, messages) => {
+        if (
+          mode !== "tutor" ||
+          index !== messages.length - 1 ||
+          message.role !== "user"
+        ) {
+          return message;
+        }
+
+        return {
+          ...message,
+          content:
+            `${message.content}\n\n` +
+            "راهنمای پاسخ‌گویی: مثل یک معلم خصوصی صبور و مهربان آموزش بده. " +
+            "موضوع را ساده و مرحله‌به‌مرحله توضیح بده، در صورت نیاز مثال بزن، " +
+            "و به‌جای فقط گفتن جواب، کمک کن کاربر دلیل و روش را یاد بگیرد. " +
+            "اگر سؤال درسی نیست، همچنان دقیق و روشن پاسخ بده.",
+        };
+      });
+
+      const response = await fetch(API_URL, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/x-ndjson",
+        },
+        body: JSON.stringify({
+          messages: apiMessages,
+          answerMode,
+          stream: true,
+        }),
+      });
+
+      if (!response.ok) {
+        let errorMessage = "دریافت پاسخ ناموفق بود.";
+
+        try {
+          const errorData = (await response.json()) as { error?: string };
+          if (errorData.error) errorMessage = errorData.error;
+        } catch {
+          // بدنهٔ خطا JSON نبود
+        }
+
+        throw new Error(errorMessage);
+      }
+
+      const answer = await readAnswerStream(response, (partialText) => {
+        updateChat(chatId, (chat) => ({
+          ...chat,
+          messages: chat.messages.map((message, index) =>
+            index === assistantMessageIndex && message.role === "assistant"
+              ? { ...message, content: partialText }
+              : message,
+          ),
+          updatedAt: Date.now(),
+        }));
+      });
+
+      // اطمینان از ذخیره پاسخ نهایی
+      updateChat(chatId, (chat) => ({
+        ...chat,
+        messages: chat.messages.map((message, index) =>
+          index === assistantMessageIndex && message.role === "assistant"
+            ? { ...message, content: answer }
+            : message,
+        ),
+        updatedAt: Date.now(),
+      }));
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error
+          ? error.message
+          : "ارتباط با سرور برقرار نشد.";
+
+      updateChat(chatId, (chat) => ({
+        ...chat,
+        messages: chat.messages.map((message, index) =>
+          index === assistantMessageIndex && message.role === "assistant"
+            ? {
+                ...message,
+                content: `**خطا در دریافت پاسخ**\n\n${errorMessage}`,
+              }
+            : message,
+        ),
+        updatedAt: Date.now(),
+      }));
+    } finally {
+      setLoadingChatId((current) => (current === chatId ? null : current));
+      setStreamingMessageKey(null);
+    }
+  }
+
+  function deleteChat(chatId: string) {
+    const remaining = chats.filter((chat) => chat.id !== chatId);
+
+    if (remaining.length === 0) {
+      const newChat = createChat();
+
+      setChats([newChat]);
+      setActiveChatId(newChat.id);
+      setInput("");
+      setStreamingMessageKey(null);
+      return;
+    }
+
+    setChats(remaining);
+
+    if (activeChatId === chatId) {
+      setActiveChatId(remaining[0].id);
+      setInput("");
+    }
+  }
+
+  return (
+    <>
+      <style>{`
+        .theme-light {
+          color-scheme: light;
+          --page-bg: #f7f8fc;
+          --panel-bg: #ffffff;
+          --surface-bg: #f0f2f8;
+          --text-color: #202336;
+          --muted-text: #62677a;
+          --border-color: #dfe3ee;
+          --accent: #6d5ce8;
+        }
+        .theme-light, .theme-light * { color-scheme: light; }
+        .theme-light .main-panel,
+        .theme-light .chat,
+        .theme-light .messages,
+        .theme-light .welcome,
+        .theme-light .sidebar { color: var(--text-color, #202336); }
+        .theme-light .brand p,
+        .theme-light .sidebar-title,
+        .theme-light .sidebar-footer p,
+        .theme-light .status,
+        .theme-light .composer-note,
+        .theme-light .message-label {
+          color: var(--muted-text, #62677a) !important;
+        }
+        .theme-light .assistant-answer,
+        .theme-light .assistant-answer p,
+        .theme-light .assistant-answer li,
+        .theme-light .assistant-answer blockquote,
+        .theme-light .assistant-answer h1,
+        .theme-light .assistant-answer h2,
+        .theme-light .assistant-answer h3,
+        .theme-light .assistant-answer h4,
+        .theme-light .assistant-answer strong,
+        .theme-light .assistant-answer em,
+        .theme-light .assistant-answer td,
+        .theme-light .assistant-answer th { color: #202336; }
+        .theme-light .assistant-answer a { color: #5141c8; }
+        .theme-light .assistant-answer blockquote { border-inline-start: 3px solid #c8c3f5; }
+        .theme-light .assistant-answer pre {
+          background: #eef0f6;
+          color: #202336;
+          border: 1px solid #dfe3ee;
+          overflow-x: auto;
+        }
+        .theme-light .assistant-answer code { color: #8a285d; background: #f0edf7; }
+        .theme-light .assistant-answer pre code { color: inherit; background: transparent; }
+        .theme-light .assistant-answer table { border-color: #dfe3ee; }
+        .theme-light .assistant-answer th,
+        .theme-light .assistant-answer td { border-color: #dfe3ee; }
+        .theme-light .user-message-content { color: #202336; }
+        .theme-light .composer textarea { color: #202336; background: #ffffff; caret-color: #5141c8; }
+        .theme-light .composer textarea::placeholder { color: #777d90; opacity: 1; }
+        .code-block-wrapper {
+          margin: 1rem 0;
+          overflow: hidden;
+          border: 1px solid var(--border-color, #dfe3ee);
+          border-radius: 12px;
+          background: var(--surface-bg, #171923);
+        }
+        .code-block-toolbar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          padding: 7px 10px;
+          border-bottom: 1px solid var(--border-color, #dfe3ee);
+          color: var(--muted-text, #777d90);
+          font-size: 12px;
+        }
+        .copy-code-button {
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 8px;
+          padding: 5px 9px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          cursor: pointer;
+        }
+        .copy-code-button:hover { background: #8882; }
+        .code-block-wrapper pre {
+          margin: 0;
+          border: 0;
+          border-radius: 0;
+          overflow-x: auto;
+          padding: 14px;
+        }
+        .theme-light .code-block-wrapper { background: #eef0f6; border-color: #dfe3ee; }
+        .theme-light .code-block-toolbar { color: #62677a; border-color: #dfe3ee; }
+        .theme-light .copy-code-button { color: #202336; }
+        .theme-light .chat-list-item.active .chat-select { color: #30276f; }
+        .theme-light .katex, .theme-light .katex * { color: #202336; }
+        .theme-light .sidebar button,
+        .theme-light .sidebar button span,
+        .theme-light .sidebar button svg,
+        .theme-light .sidebar a,
+        .theme-light .sidebar [role="button"],
+        .theme-light .chat-list-item,
+        .theme-light .chat-list-item span,
+        .theme-light .chat-list-item svg,
+        .theme-light .chat-select,
+        .theme-light .sidebar-footer,
+        .theme-light .sidebar-footer span { color: #202336; }
+        .theme-light .sidebar-title,
+        .theme-light .sidebar-footer p { color: #62677a; }
+        .theme-light .sidebar button { color: #202336 !important; }
+        .theme-light .sidebar button svg { color: inherit !important; stroke: currentColor; }
+        .theme-light .sidebar button span { color: inherit !important; }
+        .theme-light .sidebar .new-chat-button {
+          background: #6d5ce8 !important;
+          color: #ffffff !important;
+          border: 1px solid #6d5ce8 !important;
+        }
+        .theme-light .sidebar .new-chat-button span { color: #ffffff !important; }
+        .theme-light .sidebar .new-chat-button:hover { background: #5948d6 !important; color: #ffffff !important; }
+        .theme-light .message.user .user-message-content {
+          color: #202336 !important;
+          background: #e9e7ff !important;
+          border-color: #d5d0ff !important;
+        }
+        .theme-light .message.user .user-message-content * { color: #202336 !important; }
+        .theme-light .message.user .message-label { color: #62677a !important; }
+
+        .answer-mode-picker {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 8px;
+          padding: 0 2px 8px;
+        }
+        .answer-mode-button {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          border: 1px solid var(--border-color, #8885);
+          border-radius: 12px;
+          padding: 8px 12px;
+          background: transparent;
+          color: inherit;
+          font: inherit;
+          font-size: 13px;
+          cursor: pointer;
+          transition: background 150ms ease, border-color 150ms ease;
+        }
+        .answer-mode-button[aria-pressed="true"] {
+          background: var(--accent, #7867f5);
+          border-color: var(--accent, #7867f5);
+          color: white;
+          font-weight: 700;
+        }
+        .answer-mode-description {
+          flex-basis: 100%;
+          margin: 0;
+          font-size: 12px;
+          line-height: 1.7;
+          color: var(--muted-text, #777d90);
+        }
+        .streaming-cursor {
+          display: inline-block;
+          margin-inline-start: 3px;
+          animation: velora-cursor-blink 1s steps(2, start) infinite;
+        }
+        @keyframes velora-cursor-blink { to { visibility: hidden; } }
+      `}</style>
+
+      <main className={`app study-app chat-layout theme-${theme}`}>
+        <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : "sidebar-closed"}`}>
+          <div className="sidebar-header">
+            <button className="new-chat-button" onClick={startNewChat} type="button">
+              <span>＋</span> گفت‌وگوی جدید
+            </button>
+            <button
+              className="icon-button sidebar-toggle"
+              onClick={() => setSidebarOpen(false)}
+              type="button"
+              aria-label="بستن فهرست چت‌ها"
+            >
+              ×
+            </button>
+          </div>
+
+          <h3 className="sidebar-title">گفت‌وگوهای قبلی</h3>
+
+          <div className="chat-list">
+            {chats.map((chat) => (
+              <div
+                className={`chat-list-item ${chat.id === activeChatId ? "active" : ""}`}
+                key={chat.id}
+              >
+                <button
+                  className="chat-select"
+                  type="button"
+                  onClick={() => {
+                    setActiveChatId(chat.id);
+                    setInput("");
+                  }}
+                  title={chat.title}
+                >
+                  <span className="chat-icon">◷</span>
+                  <span className="chat-title">{chat.title}</span>
+                </button>
+                <button
+                  className="delete-chat-button"
+                  type="button"
+                  onClick={() => deleteChat(chat.id)}
+                  aria-label={`حذف ${chat.title}`}
+                  title="حذف گفت‌وگو"
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+
+          <div className="sidebar-footer">
+            <span className="logo small-logo">V</span>
+            <div>
+              <strong>{mode === "tutor" ? "Velora Study" : "Velora AI"}</strong>
+              <p>{mode === "tutor" ? "معلم هوشمند تو" : "دستیار هوشمند تو"}</p>
+            </div>
+          </div>
+        </aside>
+
+        <section className="main-panel">
+          <header className="topbar">
+            {!sidebarOpen && (
+              <button
+                className="icon-button"
+                onClick={() => setSidebarOpen(true)}
+                type="button"
+                aria-label="بازکردن فهرست چت‌ها"
+              >
+                ☰
+              </button>
+            )}
+
+            <div className="brand">
+              <div className="logo">V</div>
+              <div>
+                <h1>{mode === "tutor" ? "Velora Study" : "Velora AI"}</h1>
+                <p>{mode === "tutor" ? "معلم هوشمند تو" : "گفت‌وگوی آزاد"}</p>
+              </div>
+            </div>
+
+            <nav
+              aria-label="انتخاب حالت"
+              style={{
+                display: "flex",
+                gap: 8,
+                alignItems: "center",
+                justifyContent: "center",
+                flexWrap: "wrap",
+              }}
+            >
+              <button
+                type="button"
+                onClick={() => setMode("chat")}
+                aria-pressed={mode === "chat"}
+                style={{
+                  padding: "9px 16px",
+                  borderRadius: 12,
+                  border: "1px solid var(--border-color, #8885)",
+                  cursor: "pointer",
+                  font: "inherit",
+                  background: mode === "chat" ? "var(--accent, #7867f5)" : "transparent",
+                  color: mode === "chat" ? "white" : "inherit",
+                  fontWeight: mode === "chat" ? 700 : 500,
+                }}
+              >
+                💬 چت
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode("tutor")}
+                aria-pressed={mode === "tutor"}
+                style={{
+                  padding: "9px 16px",
+                  borderRadius: 12,
+                  border: "1px solid var(--border-color, #8885)",
+                  cursor: "pointer",
+                  font: "inherit",
+                  background: mode === "tutor" ? "var(--accent, #7867f5)" : "transparent",
+                  color: mode === "tutor" ? "white" : "inherit",
+                  fontWeight: mode === "tutor" ? 700 : 500,
+                }}
+              >
+                🎓 معلم هوشمند
+              </button>
+            </nav>
+
+            <div className="chat-header-actions">
+              <button
+                className="study-theme-button"
+                type="button"
+                onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+                aria-label="تغییر تم"
+              >
+                {theme === "dark" ? "☀️" : "🌙"}
+              </button>
+              <span className="status">
+                <span className="status-dot" />
+                {loadingChatId === activeChat?.id ? "در حال پاسخ‌گویی" : "آماده"}
+              </span>
+            </div>
+          </header>
+
+          <section className="chat">
+            {!activeChat || activeChat.messages.length === 0 ? (
+              <div className="welcome">
+                <div className="welcome-icon">✦</div>
+                <h2>{mode === "tutor" ? "سلام! آماده‌ای یاد بگیری؟ 🎓" : "سلام! 👋"}</h2>
+                <p>
+                  {mode === "tutor"
+                    ? "موضوع یا سؤالت را بگو تا با هم قدم‌به‌قدم یاد بگیریم."
+                    : "هر چیزی دوست داری بپرس یا درباره‌اش گپ بزن."}
+                </p>
+                <div className="suggestions">
+                  {mode === "tutor" ? (
+                    <>
+                      <button type="button" onClick={() => setInput("کسرها را با مثال ساده و مرحله‌به‌مرحله به من یاد بده.")}>
+                        ➗ آموزش یک موضوع
+                      </button>
+                      <button type="button" onClick={() => setInput("یک آزمون کوتاه از من بگیر و بعد جواب‌هایم را بررسی کن.")}>
+                        📝 آزمون تمرینی
+                      </button>
+                      <button type="button" onClick={() => setInput("این موضوع را ساده توضیح بده و در پایان یک سؤال برای تمرین از من بپرس.")}>
+                        💡 تمرین و یادگیری
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <button type="button" onClick={() => setInput("سلام! خودت را معرفی کن.")}>
+                        👋 شروع گفت‌وگو
+                      </button>
+                      <button type="button" onClick={() => setInput("چند ایدهٔ خلاقانه و جالب پیشنهاد بده.")}>
+                        ✨ ایده‌پردازی
+                      </button>
+                      <button type="button" onClick={() => setInput("این متن را خلاصه و ساده کن: ")}>
+                        📝 کمک با متن
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+            ) : (
+              <div className="messages">
+                {activeChat.messages.map((message, index) => {
+                  const messageKey = `${activeChat.id}-${index}`;
+                  const isStreaming =
+                    streamingMessageKey === messageKey &&
+                    loadingChatId === activeChat.id;
+
+                  return (
+                    <div className={`message ${message.role}`} key={messageKey}>
+                      <span className="message-label">
+                        {message.role === "user"
+                          ? "شما"
+                          : mode === "tutor"
+                            ? "معلم هوشمند"
+                            : "Velora AI"}
+                      </span>
+                      <div
+                        className={
+                          message.role === "assistant"
+                            ? "assistant-answer"
+                            : "user-message-content"
+                        }
+                        dir="auto"
+                      >
+                        {message.role === "assistant" ? (
+                          <>
+                            <AssistantContent content={message.content} />
+                            {isStreaming && (
+                              <span className="streaming-cursor" aria-hidden="true">
+                                ▍
+                              </span>
+                            )}
+                          </>
+                        ) : (
+                          message.content
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {loadingChatId === activeChat.id &&
+                  !activeChat.messages.some(
+                    (message, index) =>
+                      message.role === "assistant" &&
+                      streamingMessageKey === `${activeChat.id}-${index}`,
+                  ) && (
+                    <div className="message assistant">
+                      <span className="message-label">
+                        {mode === "tutor" ? "معلم هوشمند" : "Velora AI"}
+                      </span>
+                      <div className="assistant-answer">
+                        {answerMode === "deep"
+                          ? "در حال بررسی عمیق سؤال…"
+                          : "در حال آماده‌کردن پاسخ…"}
+                      </div>
+                    </div>
+                  )}
+              </div>
+            )}
+          </section>
+
+          <form
+            className="composer"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void sendMessage();
+            }}
+          >
+            <div className="answer-mode-picker" aria-label="حالت پاسخ‌گویی">
+              <button
+                className="answer-mode-button"
+                type="button"
+                aria-pressed={answerMode === "fast"}
+                onClick={() => setAnswerMode("fast")}
+                disabled={loadingChatId !== null}
+                title="پاسخ سریع برای سؤال‌های معمولی"
+              >
+                ⚡ پاسخ سریع
+              </button>
+
+              <button
+                className="answer-mode-button"
+                type="button"
+                aria-pressed={answerMode === "deep"}
+                onClick={() => setAnswerMode("deep")}
+                disabled={loadingChatId !== null}
+                title="برای مسائل پیچیده و چندمرحله‌ای"
+              >
+                🧠 تفکر عمیق
+              </button>
+
+              <p className="answer-mode-description">
+                {answerMode === "deep"
+                  ? "تفکر عمیق فعال است؛ ممکن است پاسخ دیرتر آماده شود."
+                  : "پاسخ سریع فعال است؛ مناسب سؤال‌های روزمره."}
+              </p>
+            </div>
+
+            <textarea
+              value={input}
+              onChange={(event) => setInput(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  void sendMessage();
+                }
+              }}
+              placeholder={
+                mode === "tutor"
+                  ? "سؤالت رو بپرس تا با هم یاد بگیریم..."
+                  : "پیامت رو بنویس..."
+              }
+              rows={1}
+              aria-label="پیام شما"
+            />
+
+            <button
+              className="send-button"
+              type="submit"
+              disabled={!input.trim() || loadingChatId !== null}
+              aria-label="ارسال پیام"
+            >
+              ↑
+            </button>
+
+            <p className="composer-note">
+              گفت‌وگوها در همین مرورگر ذخیره می‌شوند.
+            </p>
+          </form>
+        </section>
+      </main>
+    </>
+  );
+}
+
+export default App;
